@@ -11,13 +11,26 @@ Runs TWO independent scanning lanes from the same discovery feed:
   - MAIN lane:    MC $10K-$250K (the original spotter)
   - LOW-CAP lane: MC $10K-$50K  (extra, does not affect the main lane)
 
-Supports multiple authorized Telegram users (e.g. you + a friend), each with
-their own independent /threshold setting.
+Every call scoring 65+ (WATCH) or 80+ (HIGH INTEREST) is sent to every
+authorized user — no per-user threshold filtering.
 
 ⚠️ REALITY CHECK ⚠️
 This bot does NOT predict winners. Every alert needs your own 15-second look
-before you do anything with real money. Not financial advice. Never trades
-automatically.
+before you do anything with real money. Not financial advice. Buy buttons
+only execute when a user taps them — nothing is automatic.
+
+SETUP
+1. pip install websockets requests solders
+2. Telegram bot token (BotFather)
+3. Owner chat ID (TELEGRAM_CHAT_ID) and optionally a friend's chat ID
+   (FRIEND_CHAT_ID) via @userinfobot
+4. A free Helius API key from helius.dev
+5. Optional trading: WALLET_PRIVATE_KEY_OWNER / WALLET_PRIVATE_KEY_FRIEND
+   (each person's own dedicated trading wallet — only fund with what you're
+   okay losing entirely; this key cannot be revoked if it ever leaks)
+6. Env vars: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, FRIEND_CHAT_ID (optional),
+   HELIUS_API_KEY, WALLET_PRIVATE_KEY_OWNER (optional), WALLET_PRIVATE_KEY_FRIEND (optional)
+7. Run: python main.py
 """
 
 import asyncio
@@ -29,8 +42,17 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set
 
+import base64
 import requests
 import websockets
+
+try:
+    from solders.keypair import Keypair
+    from solders.transaction import VersionedTransaction
+    from solders.pubkey import Pubkey
+    SOLDERS_AVAILABLE = True
+except ImportError:
+    SOLDERS_AVAILABLE = False
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "PUT_YOUR_BOT_TOKEN_HERE")
 OWNER_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "PUT_YOUR_CHAT_ID_HERE")
@@ -57,37 +79,56 @@ HELIUS_MIN_LIQUIDITY_TO_CHECK = MIN_LIQUIDITY_USD
 SCORE_THRESHOLDS = {"watch": 65, "high": 80}
 RECENT_HISTORY_MAX = 40
 MILESTONE_MULTIPLES = [2, 5, 10, 20, 30, 40, 50]
+ALERTED_SCAN_INTERVAL_SEC = 5
+
+JUPITER_QUOTE_URL = "https://quote-api.jup.ag/v6/quote"
+JUPITER_SWAP_URL = "https://quote-api.jup.ag/v6/swap"
+SOL_MINT = "So11111111111111111111111111111111111111112"
+BUY_PERCENT_OPTIONS = [10, 25, 50, 100]
+SLIPPAGE_BPS = 500
+MAX_BUY_SOL_CAP = 1.0
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("scanner_bot")
 
 TARGET_MULTIPLES = [2, 5, 10, 20, 30, 40, 50]
 
-AUTHORIZED_USERS: Dict[str, dict] = {}
+AUTHORIZED_USERS: Set[str] = set()
 if OWNER_CHAT_ID and "PUT_YOUR" not in OWNER_CHAT_ID:
-    AUTHORIZED_USERS[str(OWNER_CHAT_ID)] = {"name": "watch", "value": SCORE_THRESHOLDS["watch"]}
+    AUTHORIZED_USERS.add(str(OWNER_CHAT_ID))
 if FRIEND_CHAT_ID:
-    AUTHORIZED_USERS[str(FRIEND_CHAT_ID)] = {"name": "watch", "value": SCORE_THRESHOLDS["watch"]}
+    AUTHORIZED_USERS.add(str(FRIEND_CHAT_ID))
 
 
 def is_authorized(chat_id: str) -> bool:
     return str(chat_id) in AUTHORIZED_USERS
 
 
-CLOSE_BUTTON_MARKUP = {"inline_keyboard": [[{"text": "❌ Close", "callback_data": "close"}]]}
+WALLET_KEYPAIRS: Dict[str, "Keypair"] = {}
+user_buy_size_sol: Dict[str, float] = {}
 
-THRESHOLD_KEYBOARD_MARKUP = {
-    "inline_keyboard": [
-        [{"text": "🟡 Watch+ (65+)", "callback_data": "thresh_watch"}],
-        [{"text": "🟢 High Interest only (80+)", "callback_data": "thresh_high"}],
-    ]
-}
+if SOLDERS_AVAILABLE:
+    owner_key_str = os.environ.get("WALLET_PRIVATE_KEY_OWNER", "").strip()
+    friend_key_str = os.environ.get("WALLET_PRIVATE_KEY_FRIEND", "").strip()
+    if owner_key_str and str(OWNER_CHAT_ID) in AUTHORIZED_USERS:
+        try:
+            WALLET_KEYPAIRS[str(OWNER_CHAT_ID)] = Keypair.from_base58_string(owner_key_str)
+        except Exception as e:
+            log.error("Failed to load owner wallet key: %s", e)
+    if friend_key_str and str(FRIEND_CHAT_ID) in AUTHORIZED_USERS:
+        try:
+            WALLET_KEYPAIRS[str(FRIEND_CHAT_ID)] = Keypair.from_base58_string(friend_key_str)
+        except Exception as e:
+            log.error("Failed to load friend wallet key: %s", e)
+
+
+CLOSE_BUTTON_MARKUP = {"inline_keyboard": [[{"text": "❌ Close", "callback_data": "close"}]]}
 
 PERSISTENT_MENU_MARKUP = {
     "keyboard": [
-        [{"text": "🕵️ Recent"}, {"text": "🎯 Threshold"}],
-        [{"text": "🪙 Coins"}, {"text": "📊 Stats"}],
-        [{"text": "ℹ️ Help"}, {"text": "🙈 Hide menu"}],
+        [{"text": "🕵️ Recent"}, {"text": "📞 Calls"}],
+        [{"text": "💰 Wallet"}, {"text": "ℹ️ Help"}],
+        [{"text": "🙈 Hide menu"}],
     ],
     "resize_keyboard": True,
     "is_persistent": True,
@@ -124,6 +165,40 @@ def send_telegram_message(text: str, chat_id: Optional[str] = None, markup: Opti
 def broadcast_to(chat_ids, text: str, markup: Optional[dict] = None) -> None:
     for cid in chat_ids:
         send_telegram_message(text, chat_id=cid, markup=markup)
+
+
+def edit_telegram_message(chat_id: str, message_id: int, text: str, markup: Optional[dict] = None) -> bool:
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/editMessageText"
+    payload = {
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "text": text,
+        "parse_mode": "Markdown",
+        "disable_web_page_preview": True,
+    }
+    if markup is not None:
+        payload["reply_markup"] = json.dumps(markup)
+    try:
+        resp = requests.post(url, json=payload, timeout=10)
+        if resp.status_code != 200:
+            log.warning("Telegram edit failed (will send new instead): %s %s", resp.status_code, resp.text)
+            return False
+        return True
+    except requests.RequestException as e:
+        log.error("Telegram edit exception: %s", e)
+        return False
+
+
+def build_buy_markup(mint: str) -> dict:
+    buy_row = [
+        {"text": f"{p}%", "callback_data": f"buy_{p}_{mint}"} for p in BUY_PERCENT_OPTIONS
+    ]
+    return {
+        "inline_keyboard": [
+            buy_row,
+            [{"text": "❌ Close", "callback_data": "close"}],
+        ]
+    }
 
 
 def delete_telegram_message(chat_id, message_id) -> None:
@@ -212,6 +287,110 @@ def get_top_holders(mint: str) -> List[float]:
         return [float(a["uiAmount"] or 0) for a in result["value"]]
     except (KeyError, TypeError, ValueError):
         return []
+
+
+def get_sol_balance(pubkey: "Pubkey") -> Optional[float]:
+    result = helius_rpc("getBalance", [str(pubkey)])
+    if result is None:
+        return None
+    try:
+        return result["value"] / 1_000_000_000
+    except (KeyError, TypeError):
+        return None
+
+
+def fetch_jupiter_quote(output_mint: str, lamports: int) -> Optional[dict]:
+    try:
+        resp = requests.get(
+            JUPITER_QUOTE_URL,
+            params={
+                "inputMint": SOL_MINT,
+                "outputMint": output_mint,
+                "amount": lamports,
+                "slippageBps": SLIPPAGE_BPS,
+            },
+            timeout=15,
+        )
+        if resp.status_code != 200:
+            log.error("Jupiter quote failed: %s %s", resp.status_code, resp.text)
+            return None
+        return resp.json()
+    except requests.RequestException as e:
+        log.error("Jupiter quote exception: %s", e)
+        return None
+
+
+def fetch_jupiter_swap_tx(quote: dict, user_pubkey: str) -> Optional[str]:
+    try:
+        resp = requests.post(
+            JUPITER_SWAP_URL,
+            json={
+                "quoteResponse": quote,
+                "userPublicKey": user_pubkey,
+                "wrapAndUnwrapSol": True,
+                "prioritizationFeeLamports": "auto",
+            },
+            timeout=15,
+        )
+        if resp.status_code != 200:
+            log.error("Jupiter swap build failed: %s %s", resp.status_code, resp.text)
+            return None
+        return resp.json().get("swapTransaction")
+    except requests.RequestException as e:
+        log.error("Jupiter swap build exception: %s", e)
+        return None
+
+
+def sign_and_send_transaction(swap_tx_b64: str, keypair: "Keypair") -> Optional[str]:
+    try:
+        raw_bytes = base64.b64decode(swap_tx_b64)
+        unsigned_tx = VersionedTransaction.from_bytes(raw_bytes)
+        signed_tx = VersionedTransaction(unsigned_tx.message, [keypair])
+        signed_bytes = bytes(signed_tx)
+        signed_b64 = base64.b64encode(signed_bytes).decode("utf-8")
+
+        result = helius_rpc("sendTransaction", [
+            signed_b64,
+            {"encoding": "base64", "skipPreflight": False, "maxRetries": 3},
+        ])
+        return result
+    except Exception as e:
+        log.error("Sign/send transaction failed: %s", e)
+        return None
+
+
+async def execute_buy(chat_id: str, mint: str, symbol: str, pct: int) -> str:
+    if not SOLDERS_AVAILABLE:
+        return "⚠️ Trading isn't available — the 'solders' package isn't installed."
+
+    keypair = WALLET_KEYPAIRS.get(chat_id)
+    if not keypair:
+        return "⚠️ No wallet configured for your account. Ask to have your wallet key added."
+
+    buy_size = user_buy_size_sol.get(chat_id, 0)
+    if buy_size <= 0:
+        return "⚠️ Set your buy size first, e.g. `/setbuysize 0.1` (SOL)."
+
+    amount_sol = min(buy_size * pct / 100, MAX_BUY_SOL_CAP)
+    lamports = int(amount_sol * 1_000_000_000)
+
+    quote = await asyncio.to_thread(fetch_jupiter_quote, mint, lamports)
+    if not quote:
+        return f"❌ Couldn't get a swap quote for ${symbol}. It may have too little liquidity right now."
+
+    swap_tx_b64 = await asyncio.to_thread(fetch_jupiter_swap_tx, quote, str(keypair.pubkey()))
+    if not swap_tx_b64:
+        return f"❌ Couldn't build the swap transaction for ${symbol}."
+
+    signature = await asyncio.to_thread(sign_and_send_transaction, swap_tx_b64, keypair)
+    if not signature:
+        return f"❌ Transaction failed to send for ${symbol}. Nothing was spent."
+
+    return (
+        f"✅ Buy sent: {amount_sol:.4f} SOL → ${symbol} ({pct}%)\n"
+        f"[View on Solscan](https://solscan.io/tx/{signature})\n\n"
+        f"Confirmation can take a few seconds — check the link above."
+    )
 
 
 @dataclass
@@ -479,18 +658,17 @@ def maybe_alert_lane(c: Candidate, lane: LaneState, lane_label: str, pair: dict,
                       score_pct: float, tier: str, top_holders: List[float], supply: Optional[float]) -> None:
     if tier not in ("HIGH_INTEREST", "WATCH"):
         return
-    for chat_id, settings in AUTHORIZED_USERS.items():
+    for chat_id in AUTHORIZED_USERS:
         if chat_id in lane.alerted_for:
             continue
-        if score_pct >= settings["value"]:
-            text = build_alert_text(c, pair, score_pct, tier, top_holders, supply, lane_label=lane_label)
-            send_telegram_message(text, chat_id=chat_id, markup=CLOSE_BUTTON_MARKUP)
-            first_ever = not lane.alerted_for
-            lane.alerted_for.add(chat_id)
-            if first_ever:
-                mc = pair.get("marketCap") or pair.get("fdv") or 0
-                lane.entry_mc = mc
-                lane.max_mc = mc
+        text = build_alert_text(c, pair, score_pct, tier, top_holders, supply, lane_label=lane_label)
+        send_telegram_message(text, chat_id=chat_id, markup=build_buy_markup(c.mint))
+        first_ever = not lane.alerted_for
+        lane.alerted_for.add(chat_id)
+        if first_ever:
+            mc = pair.get("marketCap") or pair.get("fdv") or 0
+            lane.entry_mc = mc
+            lane.max_mc = mc
 
 
 async def analyze_candidate(c: Candidate) -> None:
@@ -577,7 +755,10 @@ async def scan_loop() -> None:
         for m in stale:
             del candidates[m]
 
-        to_check = [c for c in candidates.values() if now - c.last_checked >= SCAN_INTERVAL_SEC]
+        to_check = [
+            c for c in candidates.values()
+            if now - c.last_checked >= (ALERTED_SCAN_INTERVAL_SEC if c.any_alerted else SCAN_INTERVAL_SEC)
+        ]
         for c in to_check:
             c.last_checked = now
             try:
@@ -641,100 +822,69 @@ def build_recent_message() -> str:
     return "\n".join(lines)
 
 
-def build_stats_message() -> str:
+calls_board_message_id: Dict[str, int] = {}
+
+
+def build_calls_board_text() -> str:
     called = [c for c in candidates.values() if c.any_alerted]
     if not called:
-        return "No calls yet."
+        return "📞 *Calls Board*\n\nNo calls yet — still watching."
 
-    def best_multiple(c: Candidate) -> float:
+    def peak_multiple(c: Candidate) -> float:
         m1 = (c.main.max_mc / c.main.entry_mc) if c.main.alerted and c.main.entry_mc else 0
         m2 = (c.lowcap.max_mc / c.lowcap.entry_mc) if c.lowcap.alerted and c.lowcap.entry_mc else 0
         return max(m1, m2)
 
-    called.sort(key=best_multiple, reverse=True)
-    lines = ["📊 *Call stats:*"]
-    for c in called[:20]:
-        if c.main.alerted and c.main.entry_mc:
-            mult = c.main.max_mc / c.main.entry_mc
-            icon = "✅" if c.last_mc >= c.main.entry_mc else "❌"
-            lines.append(f"{icon} ${c.symbol} — peak {mult:.1f}x (entry ${c.main.entry_mc:,.0f})")
-        if c.lowcap.alerted and c.lowcap.entry_mc:
-            mult = c.lowcap.max_mc / c.lowcap.entry_mc
-            icon = "✅" if c.last_mc >= c.lowcap.entry_mc else "❌"
-            lines.append(f"🔎 {icon} ${c.symbol} — peak {mult:.1f}x (entry ${c.lowcap.entry_mc:,.0f})")
-    return "\n".join(lines)
-
-
-def build_coins_keyboard() -> dict:
-    called = [c for c in candidates.values() if c.any_alerted]
-
-    def best_multiple(c: Candidate) -> float:
+    def is_lowcap_best(c: Candidate) -> bool:
         m1 = (c.main.max_mc / c.main.entry_mc) if c.main.alerted and c.main.entry_mc else 0
         m2 = (c.lowcap.max_mc / c.lowcap.entry_mc) if c.lowcap.alerted and c.lowcap.entry_mc else 0
-        return max(m1, m2)
+        return m2 > m1
 
-    called.sort(key=best_multiple, reverse=True)
-    rows = []
-    for c in called[:15]:
-        lane = c.main if (c.main.alerted and (not c.lowcap.alerted or c.main.max_mc / c.main.entry_mc >= c.lowcap.max_mc / max(c.lowcap.entry_mc, 1))) else c.lowcap
-        if not lane.alerted or not lane.entry_mc:
-            continue
-        mult = lane.max_mc / lane.entry_mc
-        icon = "✅" if c.last_mc >= lane.entry_mc else "❌"
-        prefix = "🔎 " if lane is c.lowcap else ""
-        label = f"{prefix}{icon} ${c.symbol} {mult:.1f}x"
-        rows.append([{"text": label, "callback_data": f"coininfo_{c.mint}"}])
-    if not rows:
-        rows = [[{"text": "No calls yet", "callback_data": "noop"}]]
-    return {"inline_keyboard": rows}
+    ranked = sorted(called, key=peak_multiple, reverse=True)
+    peaks = [peak_multiple(c) for c in ranked]
 
+    lines = ["📞 *Calls Board*", ""]
+    for i, c in enumerate(ranked[:20], start=1):
+        mult = peak_multiple(c)
+        prefix = "🔎 " if is_lowcap_best(c) else ""
+        lines.append(f"{i}. {prefix}${c.symbol} — [{mult:.1f}x]")
 
-async def build_live_coin_info(mint: str) -> str:
-    c = candidates.get(mint)
-    if not c:
-        return "That coin is no longer being tracked."
-    pair = await asyncio.to_thread(fetch_dexscreener_pair, mint)
-    if not pair:
-        return f"${c.symbol}: no live data available right now."
+    hits = sum(1 for p in peaks if p >= 2.0)
+    hit_rate = (hits / len(peaks) * 100) if peaks else 0
+    sorted_peaks = sorted(peaks)
+    n = len(sorted_peaks)
+    median = sorted_peaks[n // 2] if n % 2 == 1 else (sorted_peaks[n // 2 - 1] + sorted_peaks[n // 2]) / 2 if n else 0
+    total_return = sum(peaks)
+    avg_return = total_return / len(peaks) if peaks else 0
 
-    liquidity = (pair.get("liquidity") or {}).get("usd", 0) or 0
-    mc = pair.get("marketCap") or pair.get("fdv") or 0
-    vol = pair.get("volume") or {}
-
-    lines = [f"*{c.name}* (${c.symbol}) — live snapshot", ""]
-    lines.append(f"MC: ${mc:,.0f}")
-    lines.append(f"Liquidity: ${liquidity:,.0f}")
-    lines.append(f"1H Volume: ${vol.get('h1', 0):,.0f}")
-    lines.append(f"5M Volume: ${vol.get('m5', 0):,.0f}")
-
-    if c.main.alerted and c.main.entry_mc:
-        cur_mult = mc / c.main.entry_mc
-        peak_mult = c.main.max_mc / c.main.entry_mc
-        lines.append("")
-        lines.append(f"Main call entry MC: ${c.main.entry_mc:,.0f}")
-        lines.append(f"Current: {cur_mult:.2f}x | Peak: {peak_mult:.2f}x")
-    if c.lowcap.alerted and c.lowcap.entry_mc:
-        cur_mult = mc / c.lowcap.entry_mc
-        peak_mult = c.lowcap.max_mc / c.lowcap.entry_mc
-        lines.append("")
-        lines.append(f"🔎 Low-cap call entry MC: ${c.lowcap.entry_mc:,.0f}")
-        lines.append(f"Current: {cur_mult:.2f}x | Peak: {peak_mult:.2f}x")
-
-    lines.append("")
-    lines.append(
-        f"[DexScreener](https://dexscreener.com/solana/{pair.get('pairAddress', '')}) | "
-        f"[pump.fun](https://pump.fun/{mint})"
-    )
+    lines += [
+        "",
+        "📊 *Stats*",
+        f"Calls: {len(peaks)}",
+        f"Hit Rate (≥2x): {hit_rate:.1f}%",
+        f"Median: {median:.1f}x",
+        f"Return: {total_return:.1f}x (Avg: {avg_return:.1f}x)",
+        "",
+        "_Hit rate = reached at least 2x from call price._",
+    ]
     return "\n".join(lines)
 
 
-def send_threshold_picker(chat_id: str) -> None:
-    settings = AUTHORIZED_USERS.get(chat_id, {"name": "watch", "value": SCORE_THRESHOLDS["watch"]})
-    send_telegram_message(
-        f"Pick your alert threshold (current: *{settings['name']}*, score ≥ {settings['value']}).",
-        chat_id=chat_id,
-        markup=THRESHOLD_KEYBOARD_MARKUP,
-    )
+CALLS_BOARD_REFRESH_MARKUP = {
+    "inline_keyboard": [[{"text": "🔄 Refresh", "callback_data": "refresh_board"}]]
+}
+
+
+def send_or_update_calls_board(chat_id: str) -> None:
+    text = build_calls_board_text()
+    existing_id = calls_board_message_id.get(chat_id)
+    if existing_id:
+        ok = edit_telegram_message(chat_id, existing_id, text, markup=CALLS_BOARD_REFRESH_MARKUP)
+        if ok:
+            return
+    new_id = send_telegram_message(text, chat_id=chat_id, markup=CALLS_BOARD_REFRESH_MARKUP)
+    if new_id:
+        calls_board_message_id[chat_id] = new_id
 
 
 def _fetch_telegram_updates(offset: int) -> list:
@@ -770,17 +920,15 @@ async def telegram_command_listener() -> None:
                     if data == "close":
                         message_id = callback.get("message", {}).get("message_id")
                         await asyncio.to_thread(delete_telegram_message, cb_chat_id, message_id)
-                    elif data in ("thresh_watch", "thresh_high"):
-                        name = "watch" if data == "thresh_watch" else "high"
-                        AUTHORIZED_USERS[cb_chat_id] = {"name": name, "value": SCORE_THRESHOLDS[name]}
-                        send_telegram_message(
-                            f"🎯 Alert threshold set to *{name}* (score ≥ {SCORE_THRESHOLDS[name]}).",
-                            chat_id=cb_chat_id,
-                        )
-                    elif data.startswith("coininfo_"):
-                        mint = data[len("coininfo_"):]
-                        text = await build_live_coin_info(mint)
-                        send_telegram_message(text, chat_id=cb_chat_id, markup=CLOSE_BUTTON_MARKUP)
+                    elif data == "refresh_board":
+                        send_or_update_calls_board(cb_chat_id)
+                    elif data.startswith("buy_"):
+                        _, pct_str, mint = data.split("_", 2)
+                        pct = int(pct_str)
+                        c = candidates.get(mint)
+                        symbol = c.symbol if c else mint[:6]
+                        result_text = await execute_buy(cb_chat_id, mint, symbol, pct)
+                        send_telegram_message(result_text, chat_id=cb_chat_id, markup=CLOSE_BUTTON_MARKUP)
                     await asyncio.to_thread(answer_callback_query, callback.get("id"))
                     continue
 
@@ -792,24 +940,62 @@ async def telegram_command_listener() -> None:
 
                 if text.startswith("/recent") or text == "🕵️ Recent":
                     send_telegram_message(build_recent_message(), chat_id=chat_id)
-                elif text.startswith("/threshold") or text == "🎯 Threshold":
-                    send_threshold_picker(chat_id)
-                elif text.startswith("/coins") or text == "🪙 Coins":
-                    send_telegram_message("🪙 *Your calls:*", chat_id=chat_id, markup=build_coins_keyboard())
-                elif text.startswith("/stats") or text == "📊 Stats":
-                    send_telegram_message(build_stats_message(), chat_id=chat_id)
+                elif text.startswith("/calls") or text == "📞 Calls":
+                    send_or_update_calls_board(chat_id)
+                elif text.startswith("/setbuysize"):
+                    parts = text.split()
+                    if len(parts) < 2:
+                        send_telegram_message("Usage: `/setbuysize 0.1` (amount in SOL)", chat_id=chat_id)
+                    else:
+                        try:
+                            amount = float(parts[1])
+                            if amount <= 0 or amount > MAX_BUY_SOL_CAP:
+                                send_telegram_message(
+                                    f"Please choose an amount between 0 and {MAX_BUY_SOL_CAP} SOL.",
+                                    chat_id=chat_id,
+                                )
+                            else:
+                                user_buy_size_sol[chat_id] = amount
+                                send_telegram_message(
+                                    f"✅ Buy size set to {amount} SOL. Buy buttons will use % of this.",
+                                    chat_id=chat_id,
+                                )
+                        except ValueError:
+                            send_telegram_message("That doesn't look like a number. Example: `/setbuysize 0.1`", chat_id=chat_id)
+                elif text.startswith("/wallet") or text == "💰 Wallet":
+                    keypair = WALLET_KEYPAIRS.get(chat_id)
+                    if not SOLDERS_AVAILABLE:
+                        send_telegram_message("⚠️ Trading isn't available (solders package not installed).", chat_id=chat_id)
+                    elif not keypair:
+                        send_telegram_message(
+                            "⚠️ No wallet connected to your account yet.\n"
+                            "Use a dedicated wallet with only funds you're okay risking.",
+                            chat_id=chat_id,
+                        )
+                    else:
+                        balance = await asyncio.to_thread(get_sol_balance, keypair.pubkey())
+                        bal_text = f"{balance:.4f} SOL" if balance is not None else "unknown (couldn't fetch)"
+                        buy_size = user_buy_size_sol.get(chat_id, 0)
+                        send_telegram_message(
+                            f"💰 *Your wallet*\n"
+                            f"Address: `{keypair.pubkey()}`\n"
+                            f"Balance: {bal_text}\n"
+                            f"Buy size: {buy_size if buy_size else 'not set'} SOL "
+                            f"(set with `/setbuysize <amount>`)",
+                            chat_id=chat_id,
+                        )
                 elif text == "🙈 Hide menu":
                     send_telegram_message("Menu hidden. Send /start to bring it back.", chat_id=chat_id, markup=HIDE_MENU_MARKUP)
                 elif text.startswith("/start") or text.startswith("/help") or text == "ℹ️ Help":
-                    settings = AUTHORIZED_USERS.get(chat_id, {"name": "watch", "value": SCORE_THRESHOLDS["watch"]})
                     send_telegram_message(
                         "Commands:\n"
                         "/recent — recently scanned tokens\n"
-                        "/threshold — set your alert sensitivity (Watch+ / High Interest only)\n"
-                        "/coins — your called coins with peak X and live stats\n"
-                        "/stats — quick call performance summary\n\n"
-                        f"Your current threshold: *{settings['name']}* (score ≥ {settings['value']})\n\n"
-                        "⚠️ This is a scanner, not a trading bot. No purchases are ever made automatically.",
+                        "/calls — live-updating leaderboard of all calls\n"
+                        "/wallet — your connected wallet + balance\n"
+                        "/setbuysize <SOL> — set your buy-button base amount\n\n"
+                        "Every call scoring 65+ (WATCH) or 80+ (HIGH INTEREST) is sent to "
+                        "everyone — each alert is labeled with which tier it hit.\n\n"
+                        "⚠️ This is a scanner. Buy buttons only execute when YOU tap them — nothing is automatic.",
                         chat_id=chat_id,
                         markup=PERSISTENT_MENU_MARKUP,
                     )
@@ -820,12 +1006,13 @@ async def telegram_command_listener() -> None:
 
 async def main() -> None:
     broadcast_to(
-        AUTHORIZED_USERS.keys(),
+        AUTHORIZED_USERS,
         "✅ Solana scanner bot started.\n"
         "Watching pump.fun launches on two lanes:\n"
         "• Main: MC $10K–$250K\n"
         "• 🔎 Low-cap: MC $10K–$50K\n\n"
-        "Send /recent, /threshold, /coins, or /stats anytime.\n"
+        "Every call scoring 65+ (WATCH) or 80+ (HIGH INTEREST) goes to everyone — no threshold filtering.\n"
+        "Send /recent, /calls, or /wallet anytime.\n"
         "⚠️ Scanner only — never trades automatically. Not financial advice.",
         markup=PERSISTENT_MENU_MARKUP,
     )
