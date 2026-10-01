@@ -7,9 +7,10 @@ via pump.fun's real-time feed, enriches them with DexScreener (market cap,
 liquidity, volume, buy/sell counts) and Helius RPC (mint/freeze authority,
 top-holder concentration), scores them, and sends Telegram alerts.
 
-Runs TWO independent scanning lanes from the same discovery feed:
-  - MAIN lane:    MC $10K-$250K (the original spotter)
-  - LOW-CAP lane: MC $10K-$50K  (extra, does not affect the main lane)
+Runs TWO mutually-exclusive scanning lanes from the same discovery feed:
+  - LOW-CAP lane: MC $10K-$50K
+  - MAIN lane:    MC $50K-$250K
+A coin can only ever match one lane at a time — no overlap, no double alerts.
 
 Every call scoring 65+ (WATCH) or 80+ (HIGH INTEREST) is sent to every
 authorized user — no per-user threshold filtering.
@@ -18,19 +19,6 @@ authorized user — no per-user threshold filtering.
 This bot does NOT predict winners. Every alert needs your own 15-second look
 before you do anything with real money. Not financial advice. Buy buttons
 only execute when a user taps them — nothing is automatic.
-
-SETUP
-1. pip install websockets requests solders
-2. Telegram bot token (BotFather)
-3. Owner chat ID (TELEGRAM_CHAT_ID) and optionally a friend's chat ID
-   (FRIEND_CHAT_ID) via @userinfobot
-4. A free Helius API key from helius.dev
-5. Optional trading: WALLET_PRIVATE_KEY_OWNER / WALLET_PRIVATE_KEY_FRIEND
-   (each person's own dedicated trading wallet — only fund with what you're
-   okay losing entirely; this key cannot be revoked if it ever leaks)
-6. Env vars: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, FRIEND_CHAT_ID (optional),
-   HELIUS_API_KEY, WALLET_PRIVATE_KEY_OWNER (optional), WALLET_PRIVATE_KEY_FRIEND (optional)
-7. Run: python main.py
 """
 
 import asyncio
@@ -63,10 +51,11 @@ PUMPPORTAL_WS_URL = "wss://pumpportal.fun/api/data"
 DEXSCREENER_TOKEN_URL = "https://api.dexscreener.com/latest/dex/tokens/{mint}"
 HELIUS_RPC_URL = f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
 
-MC_MIN = 10_000
-MC_MAX = 250_000
 LOWCAP_MC_MIN = 10_000
-LOWCAP_MC_MAX = 50_000
+LOWCAP_MC_MAX = 50_000  # low-cap lane owns [LOWCAP_MC_MIN, LOWCAP_MC_MAX)
+
+MC_MIN = LOWCAP_MC_MAX
+MC_MAX = 250_000
 
 MAX_AGE_HOURS = 24
 PRIORITY_AGE_HOURS = 6
@@ -74,7 +63,7 @@ MIN_LIQUIDITY_USD = 5_000
 GOOD_LIQ_MC_RATIO = 0.10
 SCAN_INTERVAL_SEC = 20
 MAX_TRACK_AGE_SEC = 12 * 3600
-ALERTED_TRACK_AGE_SEC = 3 * 24 * 3600
+ALERTED_TRACK_AGE_SEC = 190 * 24 * 3600  # ~6 months, so the calls board's longest time filter has real data
 HELIUS_MIN_LIQUIDITY_TO_CHECK = MIN_LIQUIDITY_USD
 SCORE_THRESHOLDS = {"watch": 65, "high": 80}
 RECENT_HISTORY_MAX = 40
@@ -181,6 +170,8 @@ def edit_telegram_message(chat_id: str, message_id: int, text: str, markup: Opti
     try:
         resp = requests.post(url, json=payload, timeout=10)
         if resp.status_code != 200:
+            if "message is not modified" in resp.text.lower():
+                return True
             log.warning("Telegram edit failed (will send new instead): %s %s", resp.status_code, resp.text)
             return False
         return True
@@ -398,6 +389,7 @@ class LaneState:
     alerted_for: Set[str] = field(default_factory=set)
     entry_mc: float = 0.0
     max_mc: float = 0.0
+    called_at: float = 0.0
     milestones_hit: set = field(default_factory=set)
     last_score: float = 0.0
     tier: str = "AVOID"
@@ -669,6 +661,7 @@ def maybe_alert_lane(c: Candidate, lane: LaneState, lane_label: str, pair: dict,
             mc = pair.get("marketCap") or pair.get("fdv") or 0
             lane.entry_mc = mc
             lane.max_mc = mc
+            lane.called_at = time.time()
 
 
 async def analyze_candidate(c: Candidate) -> None:
@@ -694,7 +687,7 @@ async def analyze_candidate(c: Candidate) -> None:
     })
 
     in_main_range = MC_MIN <= mc <= MC_MAX
-    in_lowcap_range = LOWCAP_MC_MIN <= mc <= LOWCAP_MC_MAX
+    in_lowcap_range = LOWCAP_MC_MIN <= mc < LOWCAP_MC_MAX  # half-open: never overlaps main
     needs_scoring = in_main_range or in_lowcap_range or c.any_alerted
 
     if not needs_scoring:
@@ -745,7 +738,7 @@ async def analyze_candidate(c: Candidate) -> None:
         maybe_alert_lane(c, c.lowcap, "🔎 LOW-CAP ", pair, score_pct, tier, top_holders, supply)
 
 
-async def scan_loop() -> None:
+async def prune_loop() -> None:
     while True:
         now = time.time()
         stale = [
@@ -754,19 +747,44 @@ async def scan_loop() -> None:
         ]
         for m in stale:
             del candidates[m]
+        await asyncio.sleep(60)
 
+
+async def alerted_scan_loop() -> None:
+    while True:
+        now = time.time()
         to_check = [
             c for c in candidates.values()
-            if now - c.last_checked >= (ALERTED_SCAN_INTERVAL_SEC if c.any_alerted else SCAN_INTERVAL_SEC)
+            if c.any_alerted and now - c.last_checked >= ALERTED_SCAN_INTERVAL_SEC
         ]
         for c in to_check:
-            c.last_checked = now
+            c.last_checked = time.time()
+            try:
+                await analyze_candidate(c)
+            except Exception as e:
+                log.error("Error analyzing alerted %s: %s", c.mint, e)
+        await asyncio.sleep(1)
+
+
+async def discovery_scan_loop() -> None:
+    semaphore = asyncio.Semaphore(5)
+
+    async def bounded_analyze(c: Candidate) -> None:
+        async with semaphore:
+            c.last_checked = time.time()
             try:
                 await analyze_candidate(c)
             except Exception as e:
                 log.error("Error analyzing %s: %s", c.mint, e)
-            await asyncio.sleep(0.3)
 
+    while True:
+        now = time.time()
+        to_check = [
+            c for c in candidates.values()
+            if not c.any_alerted and now - c.last_checked >= SCAN_INTERVAL_SEC
+        ]
+        if to_check:
+            await asyncio.gather(*(bounded_analyze(c) for c in to_check))
         await asyncio.sleep(2)
 
 
@@ -823,66 +841,103 @@ def build_recent_message() -> str:
 
 
 calls_board_message_id: Dict[str, int] = {}
+calls_board_range: Dict[str, str] = {}
+
+RANGE_SECONDS = {
+    "12H": 12 * 3600,
+    "1D": 24 * 3600,
+    "1W": 7 * 24 * 3600,
+    "1M": 30 * 24 * 3600,
+    "2M": 60 * 24 * 3600,
+    "3M": 90 * 24 * 3600,
+    "6M": 180 * 24 * 3600,
+}
+RANGE_ORDER = ["12H", "1D", "1W", "1M", "2M", "3M", "6M"]
+DEFAULT_RANGE = "1M"
 
 
-def build_calls_board_text() -> str:
-    called = [c for c in candidates.values() if c.any_alerted]
-    if not called:
-        return "📞 *Calls Board*\n\nNo calls yet — still watching."
+def get_call_records():
+    records = []
+    for c in candidates.values():
+        if c.main.alerted and c.main.entry_mc > 0:
+            records.append((c, c.main, ""))
+        if c.lowcap.alerted and c.lowcap.entry_mc > 0:
+            records.append((c, c.lowcap, "🔎 "))
+    return records
 
-    def peak_multiple(c: Candidate) -> float:
-        m1 = (c.main.max_mc / c.main.entry_mc) if c.main.alerted and c.main.entry_mc else 0
-        m2 = (c.lowcap.max_mc / c.lowcap.entry_mc) if c.lowcap.alerted and c.lowcap.entry_mc else 0
-        return max(m1, m2)
 
-    def is_lowcap_best(c: Candidate) -> bool:
-        m1 = (c.main.max_mc / c.main.entry_mc) if c.main.alerted and c.main.entry_mc else 0
-        m2 = (c.lowcap.max_mc / c.lowcap.entry_mc) if c.lowcap.alerted and c.lowcap.entry_mc else 0
-        return m2 > m1
+def build_calls_board_text(chat_id: str) -> str:
+    range_key = calls_board_range.get(chat_id, DEFAULT_RANGE)
+    window_sec = RANGE_SECONDS[range_key]
+    now = time.time()
 
-    ranked = sorted(called, key=peak_multiple, reverse=True)
-    peaks = [peak_multiple(c) for c in ranked]
+    all_records = [
+        (c, lane, prefix) for c, lane, prefix in get_call_records()
+        if (now - lane.called_at) <= window_sec
+    ]
+    if not all_records:
+        return f"📞 *Calls Board* ({range_key})\n\nNo calls in this window yet."
 
-    lines = ["📞 *Calls Board*", ""]
-    for i, c in enumerate(ranked[:20], start=1):
-        mult = peak_multiple(c)
-        prefix = "🔎 " if is_lowcap_best(c) else ""
-        lines.append(f"{i}. {prefix}${c.symbol} — [{mult:.1f}x]")
+    def mult_of(rec) -> float:
+        _, lane, _ = rec
+        return lane.max_mc / lane.entry_mc
 
-    hits = sum(1 for p in peaks if p >= 2.0)
-    hit_rate = (hits / len(peaks) * 100) if peaks else 0
-    sorted_peaks = sorted(peaks)
-    n = len(sorted_peaks)
-    median = sorted_peaks[n // 2] if n % 2 == 1 else (sorted_peaks[n // 2 - 1] + sorted_peaks[n // 2]) / 2 if n else 0
-    total_return = sum(peaks)
-    avg_return = total_return / len(peaks) if peaks else 0
+    all_peaks = [mult_of(r) for r in all_records]
+    hits = [r for r in all_records if mult_of(r) >= 2.0]
+    hits_sorted = sorted(hits, key=mult_of, reverse=True)
+
+    lines = [f"📞 *Calls Board* ({range_key})", ""]
+    if hits_sorted:
+        for i, (c, lane, prefix) in enumerate(hits_sorted[:20], start=1):
+            mult = mult_of((c, lane, prefix))
+            lines.append(
+                f"{i}. {prefix}${c.symbol} - (${lane.entry_mc:,.0f} > ${lane.max_mc:,.0f}) - {mult:.1f}x"
+            )
+    else:
+        lines.append("No calls have reached 2x in this window yet.")
+
+    hit_rate = len(hits) / len(all_records) * 100
+    sorted_all = sorted(all_peaks)
+    n = len(sorted_all)
+    median = sorted_all[n // 2] if n % 2 == 1 else (sorted_all[n // 2 - 1] + sorted_all[n // 2]) / 2
+    hit_peaks = [mult_of(r) for r in hits]
+    total_return = sum(hit_peaks)
+    avg_return = total_return / len(hit_peaks) if hit_peaks else 0
 
     lines += [
         "",
         "📊 *Stats*",
-        f"Calls: {len(peaks)}",
+        f"Calls: {len(all_records)}",
         f"Hit Rate (≥2x): {hit_rate:.1f}%",
         f"Median: {median:.1f}x",
         f"Return: {total_return:.1f}x (Avg: {avg_return:.1f}x)",
         "",
-        "_Hit rate = reached at least 2x from call price._",
+        "_Calls count/Hit Rate/Median cover every call in this window. "
+        "Return/Avg only count calls that reached ≥2x._",
     ]
     return "\n".join(lines)
 
 
-CALLS_BOARD_REFRESH_MARKUP = {
-    "inline_keyboard": [[{"text": "🔄 Refresh", "callback_data": "refresh_board"}]]
-}
+def build_calls_board_markup(chat_id: str) -> dict:
+    current = calls_board_range.get(chat_id, DEFAULT_RANGE)
+
+    def label(r: str) -> str:
+        return f"✅ {r}" if r == current else r
+
+    row1 = [{"text": label(r), "callback_data": f"range_{r}"} for r in RANGE_ORDER[:4]]
+    row2 = [{"text": label(r), "callback_data": f"range_{r}"} for r in RANGE_ORDER[4:]]
+    return {"inline_keyboard": [row1, row2, [{"text": "🔄 Refresh", "callback_data": "refresh_board"}]]}
 
 
 def send_or_update_calls_board(chat_id: str) -> None:
-    text = build_calls_board_text()
+    text = build_calls_board_text(chat_id)
+    markup = build_calls_board_markup(chat_id)
     existing_id = calls_board_message_id.get(chat_id)
     if existing_id:
-        ok = edit_telegram_message(chat_id, existing_id, text, markup=CALLS_BOARD_REFRESH_MARKUP)
+        ok = edit_telegram_message(chat_id, existing_id, text, markup=markup)
         if ok:
             return
-    new_id = send_telegram_message(text, chat_id=chat_id, markup=CALLS_BOARD_REFRESH_MARKUP)
+    new_id = send_telegram_message(text, chat_id=chat_id, markup=markup)
     if new_id:
         calls_board_message_id[chat_id] = new_id
 
@@ -922,6 +977,11 @@ async def telegram_command_listener() -> None:
                         await asyncio.to_thread(delete_telegram_message, cb_chat_id, message_id)
                     elif data == "refresh_board":
                         send_or_update_calls_board(cb_chat_id)
+                    elif data.startswith("range_"):
+                        range_key = data[len("range_"):]
+                        if range_key in RANGE_SECONDS:
+                            calls_board_range[cb_chat_id] = range_key
+                            send_or_update_calls_board(cb_chat_id)
                     elif data.startswith("buy_"):
                         _, pct_str, mint = data.split("_", 2)
                         pct = int(pct_str)
@@ -1009,14 +1069,20 @@ async def main() -> None:
         AUTHORIZED_USERS,
         "✅ Solana scanner bot started.\n"
         "Watching pump.fun launches on two lanes:\n"
-        "• Main: MC $10K–$250K\n"
+        "• Main: MC $50K–$250K\n"
         "• 🔎 Low-cap: MC $10K–$50K\n\n"
         "Every call scoring 65+ (WATCH) or 80+ (HIGH INTEREST) goes to everyone — no threshold filtering.\n"
         "Send /recent, /calls, or /wallet anytime.\n"
         "⚠️ Scanner only — never trades automatically. Not financial advice.",
         markup=PERSISTENT_MENU_MARKUP,
     )
-    await asyncio.gather(run_discovery(), scan_loop(), telegram_command_listener())
+    await asyncio.gather(
+        run_discovery(),
+        prune_loop(),
+        alerted_scan_loop(),
+        discovery_scan_loop(),
+        telegram_command_listener(),
+    )
 
 
 if __name__ == "__main__":
